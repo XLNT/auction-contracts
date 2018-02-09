@@ -21,7 +21,6 @@ Add an `.env` file depending on which port ganache is running on and which port 
 
 ```
 // .env
-PORT=5000
 RPC_HOST="127.0.0.1"
 RPC_PORT=8545
 ```
