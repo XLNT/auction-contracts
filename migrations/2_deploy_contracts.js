@@ -27,5 +27,5 @@ async function getEIP820(from) {
 getEIP820(creator);
 
 module.exports = function(deployer) {
-  deployer.deploy(AuctionBase);
+  deployer.deploy(AuctionBase, 1000);
 };

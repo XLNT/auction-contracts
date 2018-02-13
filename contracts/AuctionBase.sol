@@ -33,11 +33,16 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
     uint256 highestBid; // Current highest bid
     address highestBidder; // Address of current highest bidder
     bool cancelled; // Flag for cancelled auctions
+    bool sellerWithdrewFunds; // Flag to see if the seller has already withdrawn
   }
 
   // Map from token ID to their corresponding auction ID.
   mapping (address => mapping(uint256 => uint256)) nftToTokenIdToAuctionId;
   Auction[] public auctions;
+
+  // Cut the auction house takes on each auction, measured in points (1/100 of a percent).
+  // Values 0-10,000 map to 0%-100%
+  uint256 public auctionHouseCut;
 
   event AuctionCreated(uint256 id, address nftAddress, uint256 tokenId);
   event AuctionSuccessful(uint256 id, address nftAddress, uint256 tokenId);
@@ -49,9 +54,11 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
   // External functions
 
   // Constructor
-  function AuctionBase() public {
+  function AuctionBase(uint256 _cut) public {
     setInterfaceImplementation('IAssetHolder', this);
     owner = msg.sender;
+    require(_cut <= 10000);
+    auctionHouseCut = _cut;
   }
 
   // @dev Retrieve auctions count
@@ -139,7 +146,8 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
       startBlock: block.number,
       highestBid: 0,
       highestBidder: address(0),
-      cancelled: false
+      cancelled: false,
+      sellerWithdrewFunds: false
     });
     uint256 newAuctionId = auctions.push(_auction) - 1;
 
@@ -188,10 +196,13 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
     // The seller gets receives highest bid when the auction is completed.
     if (msg.sender == auction.seller) {
       require(_status == AuctionStatus.Completed);
+      require(!auction.sellerWithdrewFunds);
+
       fundsFrom = auction.highestBidder;
       withdrawalAmount = auction.highestBid;
 
-      // TODO: The auction house gets a cut of the withdrawal amount.
+      uint256 houseCut = _computeAuctionHouseCut(withdrawalAmount);
+      withdrawalAmount = withdrawalAmount - houseCut;
     }
     // Highest bidder can only withdraw the NFT when the auction is completed.
     // When the auction is cancelled, the highestBidder is set to address(0).
@@ -208,6 +219,7 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
     }
 
     require(withdrawalAmount > 0);
+    if (msg.sender == auction.seller) auction.sellerWithdrewFunds = true;
     auction.fundsByBidder[fundsFrom].sub(withdrawalAmount);
     msg.sender.transfer(withdrawalAmount);
 
@@ -294,6 +306,12 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
     else {
       return AuctionStatus.Active;
     }
+  }
+
+  /// @dev Computes auction house's cut of a sale.
+  /// @param _price - highestBid for the NFT.
+  function _computeAuctionHouseCut(uint256 _price) internal view returns (uint256) {
+      return _price.mul(auctionHouseCut).div(10000);
   }
 
   // Modifiers
