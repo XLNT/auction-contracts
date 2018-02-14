@@ -29,15 +29,15 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
     uint256 startedAt; // Approximate time for when the auction was started
 
     // state
-    mapping (address => uint256) fundsByBidder; // Mapping of addresses to funds
     uint256 highestBid; // Current highest bid
     address highestBidder; // Address of current highest bidder
     bool cancelled; // Flag for cancelled auctions
-    bool sellerWithdrewFunds; // Flag to see if the seller has already withdrawn
+    bool completed;
   }
 
   // Map from token ID to their corresponding auction ID.
   mapping (address => mapping(uint256 => uint256)) nftToTokenIdToAuctionId;
+  mapping (address => uint256) auctionHouseBalances; // Mapping of addresses to funds
   Auction[] public auctions;
 
   // Cut the auction house takes on each auction, measured in points (1/100 of a percent).
@@ -102,14 +102,13 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
     );
   }
 
-  // @dev Return bid for given auction ID and bidder
-  function getBid(uint256 _auctionId, address bidder)
+  // @dev Return balance msg.sender 
+  function getBalance()
     external
     view
-    returns (uint256 bid)
+    returns (uint256 balance)
   {
-    Auction storage auction = auctions[_auctionId];
-    return auction.fundsByBidder[bidder];
+    return auctionHouseBalances[msg.sender];
   }
 
   // @dev Creates and begins a new auction.
@@ -158,78 +157,85 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
   }
 
   // @dev Implements a simplified English auction
-  // Lets msg.sender bid highestBid + bidIncrement and stores bids in fundsByBidder
+  // Lets msg.sender bid at least highestBid + bidIncrement
   // TODO: Look into the experience of bidding in an English Auction asyncronously
-  function bid(uint256 _auctionId)
+  function bid(uint256 _auctionId, uint256 _newBid)
     external
     payable
     whenNotPaused
     statusIs(AuctionStatus.Active, _auctionId)
     returns (bool success)
   {
-    require(msg.value > 0);
+    require(_newBid > 0);
+    // Add msg.value to auctionHouseBalances for msg.sender
+    auctionHouseBalances[msg.sender] = auctionHouseBalances[msg.sender].add(msg.value);
+
+    // Require balance of msg.sender be greater than _newBid
+    require(auctionHouseBalances[msg.sender] >= _newBid);
 
     Auction storage auction = auctions[_auctionId];
+    // Require _newBid be greater than or equal to auction's highestBid + bidIncrement
+    require(_newBid >= auction.highestBid + auction.bidIncrement);
 
-    // Require newBid be greater than or equal to highestBid + bidIncrement
-    uint256 newBid = auction.fundsByBidder[msg.sender].add(msg.value);
-    require(newBid >= auction.highestBid + auction.bidIncrement);
+    // Update auctionHouseBalances of previous highest bidder
+    auctionHouseBalances[auction.highestBidder] = auctionHouseBalances[auction.highestBidder].add(auction.highestBid);
 
-    // Update fundsByBidder mapping
-    auction.highestBid = newBid;
+    // Deduct _newbid from msg.sender balance
+    auctionHouseBalances[msg.sender] = auctionHouseBalances[msg.sender].sub(_newBid);
+
+    // Update auction highestBid and highestBidder
+    auction.highestBid = _newBid;
     auction.highestBidder = msg.sender;
-    auction.fundsByBidder[auction.highestBidder] = newBid;
 
     // Emit BidCreated event
-    BidCreated(_auctionId, auction.nftAddress, auction.tokenId, msg.sender, newBid);
+    BidCreated(_auctionId, auction.nftAddress, auction.tokenId, msg.sender, _newBid);
     return true;
   }
 
-  // @dev Allow people to withdraw their balances or the NFT
-  function withdrawBalance(uint256 _auctionId) external returns (bool success) {
+  // @dev Allow people to withdraw their balances
+  function withdrawBalance() public returns (bool success) {
+    uint256 transferAmount = auctionHouseBalances[msg.sender];
+    auctionHouseBalances[msg.sender] = 0;
+    msg.sender.transfer(transferAmount);
+    return true;
+  }
+
+  function completeAuction(uint256 _auctionId) public returns (bool success) {
     AuctionStatus _status = _getAuctionStatus(_auctionId);
-
     Auction storage auction = auctions[_auctionId];
-    address fundsFrom;
-    uint withdrawalAmount;
 
-    // The seller gets receives highest bid when the auction is completed.
-    if (msg.sender == auction.seller) {
-      require(_status == AuctionStatus.Completed);
-      require(!auction.sellerWithdrewFunds);
+    require(!auction.complete && _status == AuctionStatus.Completed);
 
-      fundsFrom = auction.highestBidder;
-      withdrawalAmount = auction.highestBid;
+    auction.complete = true;
 
-      uint256 houseCut = _computeAuctionHouseCut(withdrawalAmount);
-      withdrawalAmount = withdrawalAmount - houseCut;
+    // Calculate house and seller cut using auction.highestBid;
+    uint256 highestBid = auction.highestBid;
+    uint256 houseCut = _computeAuctionHouseCut(highestBid);
+    uint256 sellerCut = highestBid.sub(houseCut);
+
+    // Add houseCut to auctionHouseBalance
+    auctionHouseBalances[owner] = auctionHouseBalances[owner].add(houseCut);
+
+    // Add seller amount to auctionHouseBalance
+    auctionHouseBalances[auction.seller] = auctionHouseBalances[auction.seller].add(sellerCut);
+
+    return true;
+  }
+
+  function withdrawNFTFromAuction(uint256 _auctionId) external returns (bool success) {
+    Auction storage auction = auctions[_auctionId];
+
+    // can only be called by auction.highestBidder
+    require(msg.sender == auction.highestBidder)
+
+    AuctionStatus _status = _getAuctionStatus(_auctionId);
+    require(_status == AuctionStatus.Completed);
+
+    if (!auction.complete) {
+      completeAuction(_auctionId);
     }
-    // Highest bidder can only withdraw the NFT when the auction is completed.
-    // When the auction is cancelled, the highestBidder is set to address(0).
-    else if (msg.sender == auction.highestBidder) {
-      require(_status == AuctionStatus.Completed);
-      _transfer(auction.nftAddress, auction.highestBidder, auction.tokenId);
-      AuctionNFTWithdrawal(_auctionId, auction.nftAddress, auction.tokenId, msg.sender);
-      return true;
-    }
-    // Anyone else gets what they bid
-    else {
-      fundsFrom = msg.sender;
-      withdrawalAmount = auction.fundsByBidder[fundsFrom];
-    }
 
-    require(withdrawalAmount > 0);
-    if (msg.sender == auction.seller) auction.sellerWithdrewFunds = true;
-    auction.fundsByBidder[fundsFrom].sub(withdrawalAmount);
-    msg.sender.transfer(withdrawalAmount);
-
-    AuctionFundWithdrawal(
-      _auctionId,
-      auction.nftAddress,
-      auction.tokenId,
-      msg.sender,
-      withdrawalAmount
-    );
+    _transfer(auction.nftAddress, auction.seller, auction.tokenId);
     return true;
   }
 
@@ -273,9 +279,13 @@ contract AuctionBase is Pausable, IAssetHolder, EIP820Implementer {
   function _cancelAuction(uint256 _auctionId)
     internal
     statusIs(AuctionStatus.Active, _auctionId)
-    onlySeller(_auctionId)
+    onlyOwner
   {
     Auction storage auction = auctions[_auctionId];
+
+    // Update the highest bidders balance in auctionHouseBalances
+    auctionHouseBalances[auction.highestBidder] = auctionHouseBalances[auction.highestBidder].add(auction.highestBid);
+
     auction.cancelled = true;
     auction.highestBidder = address(0);
 
